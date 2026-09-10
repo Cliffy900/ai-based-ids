@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI-IDS &mdash; Network Intrusion Detection</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-dot {{ 'is-live' if model_ready else 'is-down' }}"></span>
+        <span class="brand-name">AI-IDS</span>
+      </div>
+      <p class="brand-tagline">Flow-based intrusion detection using machine learning, trained on CICIDS2017</p>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <section class="panel stat-panel">
+      <h2 class="panel-title">Model performance</h2>
+      <p class="panel-sub">Binary classifier &mdash; benign vs attack, evaluated on a held-out test split</p>
+
+      <div class="stat-grid">
+        <div class="stat">
+          <span class="stat-value">{{ model_stats.accuracy }}</span>
+          <span class="stat-label">accuracy</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value">{{ model_stats.roc_auc }}</span>
+          <span class="stat-label">ROC AUC</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value">{{ model_stats.training_rows }}</span>
+          <span class="stat-label">flows trained on</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value">{{ model_stats.attack_rows }}</span>
+          <span class="stat-label">attack examples</span>
+        </div>
+      </div>
+
+      <h3 class="subhead">Most influential features</h3>
+      <ul class="feature-bars">
+        {% for name, weight in model_stats.top_features %}
+        <li class="feature-row">
+          <span class="feature-name">{{ name }}</span>
+          <span class="feature-bar-track">
+            <span class="feature-bar-fill" style="width: {{ (weight * 100 / 0.113) | round(1) }}%"></span>
+          </span>
+          <span class="feature-weight">{{ "%.3f"|format(weight) }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="panel try-panel">
+      <h2 class="panel-title">Run a detection</h2>
+      <p class="panel-sub">Send a preset flow's features through the live model and see what it predicts</p>
+
+      {% if not model_ready %}
+        <p class="empty-note">Model files aren't loaded on this instance, so detections can't run here.
+          {% if model_error %}<span class="mono-inline">{{ model_error }}</span>{% endif %}</p>
+      {% else %}
+        <div class="preset-list">
+          {% for key, preset in presets.items() %}
+          <a class="preset-card {{ 'is-selected' if selected_preset == key else '' }}" href="/?preset={{ key }}">
+            <span class="preset-label">{{ preset.label }}</span>
+            <span class="preset-desc">{{ preset.description }}</span>
+          </a>
+          {% endfor %}
+        </div>
+
+        {% if result %}
+        <div class="result-box result-{{ 'attack' if result.prediction == 'ATTACK' else 'benign' }}">
+          <div class="result-head">
+            <span class="result-verdict">{{ result.prediction }}</span>
+            <span class="result-source">{{ result.preset_label }}</span>
+          </div>
+          <div class="result-metrics">
+            <span>confidence <span class="mono">{{ (result.confidence * 100) | round(1) }}%</span></span>
+            <span>attack probability <span class="mono">{{ (result.attack_probability * 100) | round(1) }}%</span></span>
+          </div>
+        </div>
+        {% else %}
+        <p class="empty-note">Pick a preset above to run it through the model.</p>
+        {% endif %}
+      {% endif %}
+    </section>
+
+    <section class="panel feed-panel">
+      <h2 class="panel-title">Recent alerts</h2>
+      <p class="panel-sub">Latest entries from the persisted alert log</p>
+
+      {% if alerts %}
+      <table class="alert-table">
+        <thead>
+          <tr>
+            <th>time</th>
+            <th>type</th>
+            <th>source</th>
+            <th>target</th>
+            <th>detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for alert in alerts %}
+          <tr>
+            <td class="mono">{{ alert.timestamp[:19] if alert.timestamp else "" }}</td>
+            <td>
+              <span class="tag {{ 'tag-scan' if alert.get('type') == 'PORT_SCAN' else 'tag-attack' }}">
+                {{ "port scan" if alert.get('type') == 'PORT_SCAN' else "ml attack" }}
+              </span>
+            </td>
+            <td class="mono">{{ alert.get('src_ip', '-') }}</td>
+            <td class="mono">{{ alert.get('target_ip') or alert.get('dst_ip', '-') }}</td>
+            <td class="mono">
+              {% if alert.get('type') == 'PORT_SCAN' %}
+                {{ alert.get('distinct_ports_contacted', '-') }} ports / {{ alert.get('window_seconds', '-') }}s
+              {% else %}
+                {{ (alert.get('attack_probability', 0) * 100) | round(1) }}% confidence
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty-note">No alerts logged yet. Run a live capture session to populate this feed.</p>
+      {% endif %}
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p>Final year project &mdash; binary flow classifier trained on CICIDS2017, paired with a host-level port-scan rule. See the write-up for dataset limitations and scope.</p>
+  </footer>
+
+</body>
+</html>

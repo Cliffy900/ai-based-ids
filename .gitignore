@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Dataset files (too large for GitHub)
+datasets/
+data/
+
+# Logs and generated output
+capture_log.txt
+alerts/logs/*.jsonl
+
+
+# saved_models/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.idea/
+*.pyc
