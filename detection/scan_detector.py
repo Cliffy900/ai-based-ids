@@ -29,10 +29,28 @@ class ScanDetector:
         # src_ip -> deque of (timestamp, dst_ip, dst_port)
         self.activity = defaultdict(deque)
 
-        # src_ip -> last time we already alerted, to avoid spamming
-        # a fresh alert on every single subsequent packet
+        # (src_ip, target_ip) -> last time we already alerted, to avoid
+        # spamming a fresh alert on every subsequent packet
         self.last_alerted = {}
-        self.realert_cooldown = 30  # seconds before re-alerting the same src_ip
+        self.realert_cooldown = 30  # seconds before re-alerting the same pair
+
+    def is_source_currently_flagged(self, src_ip, target_ip=None):
+        """
+        Non-mutating check: has this src_ip (optionally against this
+        specific target_ip) raised a scan alert recently -- within the
+        current re-alert cooldown window? Used by the ensemble to ask
+        "is this source considered a scanner right now?" without
+        triggering the packet-counting logic in record_packet().
+        """
+        now = time.time()
+        for (s_ip, t_ip), last_ts in self.last_alerted.items():
+            if s_ip != src_ip:
+                continue
+            if target_ip is not None and t_ip != target_ip:
+                continue
+            if now - last_ts <= self.realert_cooldown:
+                return True
+        return False
 
     def record_packet(self, src_ip, dst_ip, dst_port, timestamp=None):
         """
@@ -53,10 +71,7 @@ class ScanDetector:
         while history and history[0][0] < cutoff:
             history.popleft()
 
-        distinct_ports = {(dst_ip, port) for _, dst_ip, port in history}
-        # count distinct (dst_ip, port) pairs; for scan detection we
-        # mostly care about distinct ports against a given target,
-        # so also compute per-target port counts
+        # count distinct ports per target destination
         ports_per_target = defaultdict(set)
         for _, d_ip, port in history:
             ports_per_target[d_ip].add(port)
@@ -77,3 +92,12 @@ class ScanDetector:
                     }
 
         return None
+
+    def get_completed_flows(self):
+        """
+        Not used internally by ScanDetector itself -- present for
+        interface symmetry with FlowTracker where callers expect a
+        get_completed_flows()-style method. Returns an empty list since
+        ScanDetector doesn't track flows, only per-packet port activity.
+        """
+        return []
