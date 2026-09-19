@@ -1,6 +1,6 @@
 import warnings
 warnings.simplefilter("ignore", category=UserWarning)
-from scapy.all import sniff
+from scapy.all import sniff, conf
 from scapy.layers.inet import IP, TCP, UDP
 from datetime import datetime
 from detection.scan_detector import ScanDetector
@@ -9,6 +9,8 @@ scan_detector = ScanDetector(window_seconds=10, port_threshold=15)
 
 from preprocessing.feature_extraction import FlowTracker
 from detection.detector import Detector
+from detection.multiclass_detector import MulticlassDetector
+from detection.ensemble import EnsembleDetector
 from alerts.alert_manager import AlertManager
 import json
 import subprocess
@@ -20,6 +22,8 @@ def run_scan_test(target_ip, nmap_path=r"C:\Program Files (x86)\Nmap\nmap.exe"):
 
 tracker = FlowTracker()
 detector = Detector()
+multiclass_detector = MulticlassDetector()
+ensemble = EnsembleDetector(detector, scan_detector, multiclass_detector)
 alert_manager = AlertManager()
 
 import socket
@@ -57,6 +61,14 @@ def get_default_gateway():
         if match and match != "0.0.0.0":
             return match
     return None
+
+def get_active_interface():
+    """
+    Returns the scapy interface currently used for the default route --
+    avoids hardcoding 'Ethernet' vs a WiFi adapter name, which changes
+    depending on which network/adapter is actually active.
+    """
+    return conf.iface
 
 def process_packet(packet):
     if packet.haslayer(IP):
@@ -134,6 +146,9 @@ if __name__ == "__main__":
     local_ip = get_local_ip()
     print(f"Detected local IP: {local_ip}")
 
+    active_iface = get_active_interface()
+    print(f"Detected active interface: {active_iface}")
+
     target_ip = get_default_gateway()
     if not target_ip:
         print("Could not detect default gateway, falling back to manual entry.")
@@ -143,16 +158,18 @@ if __name__ == "__main__":
     run_scan_test(target_ip=target_ip)
     time.sleep(1)  # give nmap a moment to actually start sending packets
 
-    start_capture(interface="Ethernet", packet_count=0, bpf_filter=f"host {target_ip}", timeout=15)
+    start_capture(interface=active_iface, packet_count=0, bpf_filter=f"host {target_ip}", timeout=15)
 
     print("\nCapture stopped.")
 
     all_flows = tracker.get_active_flow_features() + tracker.get_completed_flows()
 
-    print(f"\n--- {len(all_flows)} TOTAL FLOWS AFTER CAPTURE ---")
+    print(f"\n--- {len(all_flows)} TOTAL FLOWS AFTER CAPTURE (ensemble decision) ---")
     for flow_features in all_flows:
-        result = detector.predict(flow_features)
-        print(f"{result['prediction']} (confidence: {result['confidence']:.2f}) | "
+        result = ensemble.evaluate(flow_features)
+        signals = ", ".join(result["contributing_signals"]) if result["contributing_signals"] else "none"
+        type_str = f" | type: {result['attack_type']}" if result["attack_type"] else ""
+        print(f"{result['prediction']} (signals: {signals}) | "
               f"{result['src_ip']}:{result['src_port']} -> {result['dst_ip']}:{result['dst_port']} "
-              f"[{result['protocol']}]")
+              f"[{result['protocol']}]{type_str}")
         alert_manager.process_detection(result)
