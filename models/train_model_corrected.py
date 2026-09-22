@@ -11,9 +11,9 @@ regardless of whether the attack ultimately succeeded.
 """
 
 import os
+
 import joblib
 import pandas as pd
-import numpy as np
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -25,19 +25,11 @@ from sklearn.metrics import (
     accuracy_score,
 )
 
+from preprocessing.feature_schema import FEATURE_COLUMNS
+
+
 DATASET_PATH = "data/datasets/CICIDS2017_corrected/combined_cleaned_corrected.csv"
 MODEL_OUTPUT_DIR = "saved_models"
-
-FEATURE_COLUMNS = [
-    "Destination Port", "Flow Duration", "Total Fwd Packets", "Total Backward Packets",
-    "Total Length of Fwd Packets", "Total Length of Bwd Packets",
-    "Fwd Packet Length Max", "Fwd Packet Length Min", "Fwd Packet Length Mean", "Fwd Packet Length Std",
-    "Bwd Packet Length Max", "Bwd Packet Length Min", "Bwd Packet Length Mean", "Bwd Packet Length Std",
-    "Flow Bytes/s", "Flow Packets/s", "Flow IAT Mean", "Flow IAT Std", "Flow IAT Max", "Flow IAT Min",
-    "Fwd PSH Flags", "SYN Flag Count", "RST Flag Count", "ACK Flag Count", "FIN Flag Count",
-    "Fwd Header Length", "Bwd Header Length", "Min Packet Length", "Max Packet Length",
-    "Packet Length Mean", "Packet Length Std",
-]
 
 
 def load_data():
@@ -48,10 +40,18 @@ def load_data():
 
 
 def prepare_binary_labels(df):
-    df["binary_label"] = df["Label"].apply(lambda x: 0 if x.strip() == "BENIGN" else 1)
+    """
+    Collapses the multi-class Label column into binary:
+    0 = BENIGN, 1 = ATTACK (including attempted attacks).
+    """
+    df["binary_label"] = df["Label"].apply(
+        lambda x: 0 if x.strip() == "BENIGN" else 1
+    )
+
     print("\nBinary label distribution:")
     print(df["binary_label"].value_counts())
     print("  0 = BENIGN, 1 = ATTACK (including attempted attacks)")
+
     return df
 
 
@@ -70,7 +70,11 @@ def train_and_evaluate(df):
 
     print("\nTraining RandomForestClassifier on corrected dataset ...")
     model = RandomForestClassifier(
-        n_estimators=100, max_depth=20, class_weight="balanced", n_jobs=-1, random_state=42,
+        n_estimators=100,
+        max_depth=20,
+        class_weight="balanced",
+        n_jobs=-1,
+        random_state=42,
     )
     model.fit(X_train_scaled, y_train)
 
@@ -80,12 +84,18 @@ def train_and_evaluate(df):
 
     print(f"\nAccuracy: {accuracy_score(y_test, y_pred):.4f}")
     print(f"ROC AUC: {roc_auc_score(y_test, y_proba):.4f}")
+
     print("\nClassification Report:")
     print(classification_report(y_test, y_pred, target_names=["BENIGN", "ATTACK"]))
+
     print("Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred))
 
-    importances = pd.Series(model.feature_importances_, index=FEATURE_COLUMNS).sort_values(ascending=False)
+    importances = pd.Series(
+        model.feature_importances_,
+        index=FEATURE_COLUMNS,
+    ).sort_values(ascending=False)
+
     print("\nTop 10 most important features:")
     print(importances.head(10))
 
@@ -94,9 +104,20 @@ def train_and_evaluate(df):
 
 def save_model(model, scaler):
     os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True)
-    joblib.dump(model, os.path.join(MODEL_OUTPUT_DIR, "binary_ids_model_corrected.joblib"))
-    joblib.dump(scaler, os.path.join(MODEL_OUTPUT_DIR, "binary_ids_scaler_corrected.joblib"))
-    print("\nSaved corrected model and scaler to saved_models/ (separate filenames from the original)")
+
+    joblib.dump(
+        model,
+        os.path.join(MODEL_OUTPUT_DIR, "binary_ids_model_corrected.joblib"),
+    )
+    joblib.dump(
+        scaler,
+        os.path.join(MODEL_OUTPUT_DIR, "binary_ids_scaler_corrected.joblib"),
+    )
+
+    print(
+        "\nSaved corrected model and scaler to saved_models/ "
+        "(separate filenames from the original)"
+    )
 
 
 if __name__ == "__main__":
