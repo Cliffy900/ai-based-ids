@@ -6,47 +6,17 @@ features produced by preprocessing/feature_extraction.py's FlowTracker.
 """
 
 import os
+
 import joblib
 import numpy as np
 import pandas as pd
 
+from preprocessing.feature_schema import FEATURE_COLUMNS
+
+
 MODEL_DIR = "saved_models"
 MODEL_PATH = os.path.join(MODEL_DIR, "binary_ids_model.joblib")
 SCALER_PATH = os.path.join(MODEL_DIR, "binary_ids_scaler.joblib")
-
-FEATURE_COLUMNS = [
-    "Destination Port",
-    "Flow Duration",
-    "Total Fwd Packets",
-    "Total Backward Packets",
-    "Total Length of Fwd Packets",
-    "Total Length of Bwd Packets",
-    "Fwd Packet Length Max",
-    "Fwd Packet Length Min",
-    "Fwd Packet Length Mean",
-    "Fwd Packet Length Std",
-    "Bwd Packet Length Max",
-    "Bwd Packet Length Min",
-    "Bwd Packet Length Mean",
-    "Bwd Packet Length Std",
-    "Flow Bytes/s",
-    "Flow Packets/s",
-    "Flow IAT Mean",
-    "Flow IAT Std",
-    "Flow IAT Max",
-    "Flow IAT Min",
-    "Fwd PSH Flags",
-    "SYN Flag Count",
-    "RST Flag Count",
-    "ACK Flag Count",
-    "FIN Flag Count",
-    "Fwd Header Length",
-    "Bwd Header Length",
-    "Min Packet Length",
-    "Max Packet Length",
-    "Packet Length Mean",
-    "Packet Length Std",
-]
 
 METADATA_KEYS = ["_src_ip", "_dst_ip", "_src_port", "_protocol"]
 
@@ -62,9 +32,23 @@ class Detector:
         print("Detector ready.")
 
     def _flow_to_feature_vector(self, flow_features: dict):
-        row = {col: flow_features.get(col, 0) for col in FEATURE_COLUMNS}
-        df_row = pd.DataFrame([row], columns=FEATURE_COLUMNS)
-        return df_row
+        """
+        Convert a flow feature dictionary into the exact feature order
+        expected by the trained model.
+
+        Missing model features are rejected instead of silently replaced
+        with zero, which could hide schema mismatches and produce
+        unreliable predictions.
+        """
+        missing = [col for col in FEATURE_COLUMNS if col not in flow_features]
+
+        if missing:
+            raise ValueError(
+                f"Flow is missing required model features: {missing}"
+            )
+
+        row = {col: flow_features[col] for col in FEATURE_COLUMNS}
+        return pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
     def predict(self, flow_features: dict):
         X = self._flow_to_feature_vector(flow_features)
