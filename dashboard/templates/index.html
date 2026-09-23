@@ -108,28 +108,66 @@
             <th>detail</th>
           </tr>
         </thead>
+
         <tbody>
           {% for alert in alerts %}
           <tr>
-            <td class="mono">{{ alert.timestamp[:19] if alert.timestamp else "" }}</td>
+
+            <td class="mono">
+              {{ alert.timestamp[:19] if alert.timestamp else "" }}
+            </td>
+
             <td>
-              <span class="tag {{ 'tag-scan' if alert.get('type') == 'PORT_SCAN' else 'tag-attack' }}">
-                {{ "port scan" if alert.get('type') == 'PORT_SCAN' else "ml attack" }}
+              <span class="tag {{
+                'tag-scan'
+                if alert.get('type') == 'PORT_SCAN'
+                or 'rule_based_scan' in alert.get('contributing_signals', [])
+                else 'tag-attack'
+              }}">
+                {% if alert.get('attack_type') %}
+                  {{ alert.get('attack_type') }}
+                {% elif alert.get('type') == 'PORT_SCAN' %}
+                  port scan
+                {% else %}
+                  ml attack
+                {% endif %}
               </span>
             </td>
-            <td class="mono">{{ alert.get('src_ip', '-') }}</td>
-            <td class="mono">{{ alert.get('target_ip') or alert.get('dst_ip', '-') }}</td>
+
+            <td class="mono">
+              {{ alert.get('src_ip', '-') }}
+            </td>
+
+            <td class="mono">
+              {{ alert.get('target_ip') or alert.get('dst_ip', '-') }}
+            </td>
+
             <td class="mono">
               {% if alert.get('type') == 'PORT_SCAN' %}
-                {{ alert.get('distinct_ports_contacted', '-') }} ports / {{ alert.get('window_seconds', '-') }}s
+
+                {{ alert.get('distinct_ports_contacted', '-') }}
+                ports /
+                {{ alert.get('window_seconds', '-') }}s
+
               {% else %}
-                {{ (alert.get('attack_probability', 0) * 100) | round(1) }}% confidence
+
+                {{ (alert.get('attack_probability', 0) * 100) | round(1) }}%
+                attack probability
+
+                {% if alert.get('type_confidence') %}
+                  /
+                  {{ (alert.get('type_confidence') * 100) | round(1) }}%
+                  type confidence
+                {% endif %}
+
               {% endif %}
             </td>
+
           </tr>
           {% endfor %}
         </tbody>
       </table>
+
       {% else %}
       <p class="empty-note">No alerts logged yet. Run a live capture session to populate this feed.</p>
       {% endif %}
