@@ -20,16 +20,29 @@ from detection.scan_detector import ScanDetector
 from preprocessing.feature_extraction import FlowTracker
 
 
-scan_detector = ScanDetector(window_seconds=10, port_threshold=15)
+# Live capture uses a shorter flow timeout so completed flows can
+# be evaluated while packet capture is still running.
+LIVE_FLOW_TIMEOUT = 5
 
-tracker = FlowTracker()
+
+scan_detector = ScanDetector(
+    window_seconds=10,
+    port_threshold=15,
+)
+
+tracker = FlowTracker(
+    flow_timeout=LIVE_FLOW_TIMEOUT,
+)
+
 detector = Detector()
 multiclass_detector = MulticlassDetector()
+
 ensemble = EnsembleDetector(
     detector,
     scan_detector,
     multiclass_detector,
 )
+
 alert_manager = AlertManager()
 
 
@@ -53,7 +66,9 @@ def run_scan_test(target_ip, nmap_path=None):
     print(f"Launching nmap scan against {target_ip} ...")
 
     try:
-        subprocess.Popen([nmap_path, "-sS", target_ip])
+        subprocess.Popen(
+            [nmap_path, "-sS", target_ip]
+        )
     except OSError as exc:
         raise RuntimeError(
             f"Failed to launch Nmap using '{nmap_path}': {exc}"
@@ -68,13 +83,18 @@ def get_local_ip():
     the operating system determine which local interface/address it
     would use to reach the destination.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+    )
 
     try:
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
+
     except OSError:
         return "127.0.0.1"
+
     finally:
         s.close()
 
@@ -106,11 +126,19 @@ def _get_linux_gateway():
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
+
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+    ):
         return None
 
     for line in output.splitlines():
-        match = re.match(r"^default via ([\d.]+)", line.strip())
+        match = re.match(
+            r"^default via ([\d.]+)",
+            line.strip(),
+        )
+
         if match:
             return match.group(1)
 
@@ -126,7 +154,11 @@ def _get_windows_gateway():
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
+
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+    ):
         return None
 
     matches = re.findall(
@@ -151,6 +183,45 @@ def get_active_interface():
     return conf.iface
 
 
+def evaluate_completed_flows(completed_flows):
+    """
+    Evaluate newly completed flows through the ensemble detector.
+
+    Returns the detection results so the caller can optionally use
+    them for logging or additional processing.
+    """
+    results = []
+
+    for flow_features in completed_flows:
+        result = ensemble.evaluate(flow_features)
+
+        signals = (
+            ", ".join(result["contributing_signals"])
+            if result["contributing_signals"]
+            else "none"
+        )
+
+        type_str = (
+            f" | type: {result['attack_type']}"
+            if result["attack_type"]
+            else ""
+        )
+
+        print(
+            f"\n[LIVE DETECTION] "
+            f"{result['prediction']} "
+            f"(signals: {signals}) | "
+            f"{result['src_ip']}:{result['src_port']} -> "
+            f"{result['dst_ip']}:{result['dst_port']} "
+            f"[{result['protocol']}]{type_str}"
+        )
+
+        alert_manager.process_detection(result)
+        results.append(result)
+
+    return results
+
+
 def process_packet(packet):
     """Convert an IP packet into flow information and update detectors."""
     if not packet.haslayer(IP):
@@ -166,6 +237,7 @@ def process_packet(packet):
         proto_name = "TCP"
         sport = packet[TCP].sport
         dport = packet[TCP].dport
+
         header_length += packet[TCP].dataofs * 4
         tcp_flags = str(packet[TCP].flags)
 
@@ -187,15 +259,18 @@ def process_packet(packet):
     }
 
     print(
-        f"[{info['timestamp']}] {info['src']}:{info['sport']} -> "
-        f"{info['dst']}:{info['dport']} | {info['protocol']} | "
+        f"[{info['timestamp']}] "
+        f"{info['src']}:{info['sport']} -> "
+        f"{info['dst']}:{info['dport']} | "
+        f"{info['protocol']} | "
         f"{info['length']} bytes"
     )
 
-    # Update the flow tracker.
-    tracker.process_packet_info(info)
+    completed_flows = tracker.process_packet_info(info)
 
-    # Check every packet for port-scan activity.
+    if completed_flows:
+        evaluate_completed_flows(completed_flows)
+
     scan_alert = scan_detector.record_packet(
         src_ip=info["src"],
         dst_ip=info["dst"],
@@ -211,10 +286,17 @@ def process_packet(packet):
             f"{scan_alert['window_seconds']}s\n"
         )
 
-        alert_manager.recent_alerts.append(scan_alert)
+        alert_manager.recent_alerts.append(
+            scan_alert
+        )
 
-        with open(alert_manager.log_file, "a") as f:
-            f.write(json.dumps(scan_alert) + "\n")
+        with open(
+            alert_manager.log_file,
+            "a",
+        ) as f:
+            f.write(
+                json.dumps(scan_alert) + "\n"
+            )
 
     return info
 
@@ -263,9 +345,10 @@ if __name__ == "__main__":
 
     print(f"Detected target IP (gateway): {target_ip}")
 
-    run_scan_test(target_ip=target_ip)
+    run_scan_test(
+        target_ip=target_ip
+    )
 
-    # Give Nmap a moment to start generating packets.
     time.sleep(1)
 
     start_capture(
@@ -277,37 +360,17 @@ if __name__ == "__main__":
 
     print("\nCapture stopped.")
 
-    all_flows = (
+    # Evaluate flows that were still active when capture stopped.
+    remaining_flows = (
         tracker.get_active_flow_features()
         + tracker.get_completed_flows()
     )
 
     print(
-        f"\n--- {len(all_flows)} TOTAL FLOWS AFTER CAPTURE "
-        f"(ensemble decision) ---"
+        f"\n--- {len(remaining_flows)} REMAINING FLOWS "
+        f"AFTER CAPTURE ---"
     )
 
-    for flow_features in all_flows:
-        result = ensemble.evaluate(flow_features)
-
-        signals = (
-            ", ".join(result["contributing_signals"])
-            if result["contributing_signals"]
-            else "none"
-        )
-
-        type_str = (
-            f" | type: {result['attack_type']}"
-            if result["attack_type"]
-            else ""
-        )
-
-        print(
-            f"{result['prediction']} "
-            f"(signals: {signals}) | "
-            f"{result['src_ip']}:{result['src_port']} -> "
-            f"{result['dst_ip']}:{result['dst_port']} "
-            f"[{result['protocol']}]{type_str}"
-        )
-
-        alert_manager.process_detection(result)
+    evaluate_completed_flows(
+        remaining_flows
+    )
