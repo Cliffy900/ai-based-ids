@@ -325,9 +325,9 @@ def start_capture(
         store=False,
     )
 
-
 if __name__ == "__main__":
     import time
+    import threading
 
     local_ip = get_local_ip()
     print(f"Detected local IP: {local_ip}")
@@ -345,32 +345,47 @@ if __name__ == "__main__":
 
     print(f"Detected target IP (gateway): {target_ip}")
 
-    run_scan_test(
-        target_ip=target_ip
+    # Start packet capture before launching the scan so the
+    # scanner's traffic is not missed.
+    capture_thread = threading.Thread(
+        target=start_capture,
+        kwargs={
+            "interface": active_iface,
+            "packet_count": 0,
+            "bpf_filter": f"host {target_ip}",
+            "timeout": 15,
+        },
     )
 
+    print("Starting packet capture...")
+    capture_thread.start()
+
+    # Give Scapy a moment to begin sniffing.
     time.sleep(1)
 
-    start_capture(
-        interface=active_iface,
-        packet_count=0,
-        bpf_filter=f"host {target_ip}",
-        timeout=15,
-    )
+    # Launch the test scan while packet capture is already running.
+    run_scan_test(target_ip=target_ip)
 
-    print("\nCapture stopped.")
+    # Wait for packet capture to finish.
+    capture_thread.join()
+
+    # Evaluate any flows that completed but were not evaluated live.
+    completed_flows = tracker.get_completed_flows()
+
+    if completed_flows:
+        print(
+            f"\n--- {len(completed_flows)} COMPLETED FLOWS AFTER CAPTURE ---"
+        )
+        evaluate_completed_flows(completed_flows)
 
     # Evaluate flows that were still active when capture stopped.
-    remaining_flows = (
-        tracker.get_active_flow_features()
-        + tracker.get_completed_flows()
-    )
+    active_flows = tracker.get_active_flow_features()
 
-    print(
-        f"\n--- {len(remaining_flows)} REMAINING FLOWS "
-        f"AFTER CAPTURE ---"
-    )
+    if active_flows:
+        print(
+            f"\n--- {len(active_flows)} ACTIVE FLOWS AFTER CAPTURE ---"
+        )
+        evaluate_completed_flows(active_flows)
 
-    evaluate_completed_flows(
-        remaining_flows
-    )
+    if not completed_flows and not active_flows:
+        print("\n--- NO FLOWS REMAINED AFTER CAPTURE ---")

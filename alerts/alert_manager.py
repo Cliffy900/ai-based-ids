@@ -1,86 +1,168 @@
 """
 alerts/alert_manager.py
 
-Handles what happens when the detector flags a flow as an attack:
-logging to file, console warnings, and in-memory storage for the
-dashboard to query.
+Handles attack alerts produced by the ensemble detector.
+
+Responsibilities:
+- filter detections using the configured ML probability threshold
+- preserve ensemble detection information
+- prevent repeated flows from creating duplicate alerts
+- print alerts to the console
+- store alerts in memory for the dashboard
+- persist alerts as JSON Lines
 """
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
+
 
 ALERTS_LOG_DIR = "alerts/logs"
 ALERTS_LOG_FILE = os.path.join(ALERTS_LOG_DIR, "alerts.jsonl")
 
-# how many recent alerts to keep in memory for quick dashboard access
+# How many recent alerts to keep in memory for dashboard access.
 MAX_RECENT_ALERTS = 500
 
-# only alert if the model's attack probability crosses this threshold
-# (lets you tune sensitivity without retraining)
+# ML detections below this probability are not alerted.
 ALERT_THRESHOLD = 0.5
+
+# Repeated detections belonging to the same incident are suppressed
+# during this period.
+INCIDENT_COOLDOWN_SECONDS = 30
 
 
 class AlertManager:
-    def __init__(self, log_file=ALERTS_LOG_FILE, alert_threshold=ALERT_THRESHOLD):
+    def __init__(
+        self,
+        log_file=ALERTS_LOG_FILE,
+        alert_threshold=ALERT_THRESHOLD,
+        incident_cooldown=INCIDENT_COOLDOWN_SECONDS,
+    ):
         self.log_file = log_file
         self.alert_threshold = alert_threshold
+        self.incident_cooldown = incident_cooldown
+
         self.recent_alerts = deque(maxlen=MAX_RECENT_ALERTS)
 
-        os.makedirs(ALERTS_LOG_DIR, exist_ok=True)
+        # Maps an incident key to the time its last alert was raised.
+        self.active_incidents = {}
+
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
 
     def process_detection(self, detection_result: dict):
         """
-        detection_result: dict from Detector.predict(), e.g.
-        {
-            "prediction": "ATTACK",
-            "confidence": 0.93,
-            "attack_probability": 0.93,
-            "src_ip": "1.2.3.4",
-            "dst_ip": "10.0.0.5",
-            "src_port": 5000,
-            "dst_port": 80,
-            "protocol": "TCP"
-        }
+        Process one detection result from EnsembleDetector.
 
-        Returns True if an alert was raised, False otherwise.
+        Returns:
+            True if a new alert was raised.
+            False if the detection was benign, below threshold,
+            or suppressed as a duplicate incident.
         """
-        if detection_result["prediction"] != "ATTACK":
+
+        if detection_result.get("prediction") != "ATTACK":
             return False
 
-        if detection_result["attack_probability"] < self.alert_threshold:
+        contributing_signals = detection_result.get(
+            "contributing_signals", []
+        )
+
+        attack_probability = detection_result.get(
+            "attack_probability", 0.0
+        )
+
+        # ML threshold applies to ML-driven detections.
+        #
+        # A rule-based scan is already an independent detection signal,
+        # so it should not be blocked simply because the ML model gave
+        # it a low attack probability.
+        ml_signal = "ml_model" in contributing_signals
+        rule_based_signal = "rule_based_scan" in contributing_signals
+
+        if ml_signal and not rule_based_signal:
+            if attack_probability < self.alert_threshold:
+                return False
+
+        # If neither signal is present, do not create an alert.
+        if not ml_signal and not rule_based_signal:
+            return False
+
+        attack_type = detection_result.get("attack_type")
+
+        # Multiple flows from the same source to the same destination
+        # with the same attack type are treated as one incident during
+        # the cooldown period.
+        incident_key = (
+            detection_result.get("src_ip"),
+            detection_result.get("dst_ip"),
+            attack_type or "Unknown",
+        )
+
+        if self._is_duplicate_incident(incident_key):
             return False
 
         alert = {
             "timestamp": datetime.now().isoformat(),
-            "src_ip": detection_result["src_ip"],
-            "dst_ip": detection_result["dst_ip"],
-            "src_port": detection_result["src_port"],
-            "dst_port": detection_result["dst_port"],
-            "protocol": detection_result["protocol"],
-            "attack_probability": detection_result["attack_probability"],
-            "confidence": detection_result["confidence"],
+            "src_ip": detection_result.get("src_ip"),
+            "dst_ip": detection_result.get("dst_ip"),
+            "src_port": detection_result.get("src_port"),
+            "dst_port": detection_result.get("dst_port"),
+            "protocol": detection_result.get("protocol"),
+            "attack_probability": attack_probability,
+            "confidence": detection_result.get("confidence"),
+            "attack_type": attack_type,
+            "type_confidence": detection_result.get("type_confidence"),
+            "contributing_signals": contributing_signals,
+            "incident_key": incident_key,
         }
 
         self._raise_alert(alert)
+
+        self.active_incidents[incident_key] = datetime.now()
+
+        return True
+
+    def _is_duplicate_incident(self, incident_key):
+        """
+        Returns True when an incident was already alerted recently.
+        """
+
+        last_alert_time = self.active_incidents.get(incident_key)
+
+        if last_alert_time is None:
+            return False
+
+        elapsed = datetime.now() - last_alert_time
+
+        if elapsed >= timedelta(seconds=self.incident_cooldown):
+            del self.active_incidents[incident_key]
+            return False
+
         return True
 
     def _raise_alert(self, alert: dict):
-        # console warning, visually distinct from normal traffic logs
+        """
+        Print and persist a new alert.
+        """
+
+        signals = ", ".join(alert["contributing_signals"])
+        attack_type = alert.get("attack_type") or "Unknown"
+
         print(
             f"\n🚨 ALERT [{alert['timestamp']}] "
-            f"{alert['src_ip']}:{alert['src_port']} -> "
-            f"{alert['dst_ip']}:{alert['dst_port']} "
-            f"[{alert['protocol']}] "
-            f"(attack probability: {alert['attack_probability']:.2%})\n"
+            f"{attack_type}\n"
+            f"   Source: {alert['src_ip']}:{alert['src_port']} "
+            f"-> {alert['dst_ip']}:{alert['dst_port']} "
+            f"[{alert['protocol']}]\n"
+            f"   Signals: {signals}\n"
+            f"   ML attack probability: "
+            f"{alert['attack_probability']:.2%}\n"
         )
 
-        # store in memory for quick dashboard access
+        # Store in memory for dashboard access.
         self.recent_alerts.append(alert)
 
-        # append to persistent log file (JSON Lines format -- one
-        # JSON object per line, easy to append to and easy to parse)
+        # Persist as JSON Lines.
         with open(self.log_file, "a") as f:
             f.write(json.dumps(alert) + "\n")
 
@@ -89,27 +171,34 @@ class AlertManager:
         return list(self.recent_alerts)[-limit:][::-1]
 
     def get_alert_count(self):
+        """Returns the number of alerts currently stored in memory."""
         return len(self.recent_alerts)
 
     def load_all_alerts_from_log(self):
         """
-        Reads the full persistent log file from disk. Useful for the
-        dashboard to show historical alerts beyond what's in memory.
+        Reads the full persistent alert log from disk.
+
+        Useful for the dashboard to display historical alerts beyond
+        what is currently stored in memory.
         """
+
         if not os.path.exists(self.log_file):
             return []
 
         alerts = []
+
         with open(self.log_file, "r") as f:
             for line in f:
                 line = line.strip()
+
                 if line:
                     alerts.append(json.loads(line))
+
         return alerts
 
 
 if __name__ == "__main__":
-    # quick standalone test
+    # Quick standalone test.
     manager = AlertManager()
 
     fake_attack = {
@@ -121,6 +210,9 @@ if __name__ == "__main__":
         "src_port": 4444,
         "dst_port": 22,
         "protocol": "TCP",
+        "contributing_signals": ["ml_model"],
+        "attack_type": "Brute Force",
+        "type_confidence": 0.91,
     }
 
     fake_benign = {
@@ -132,15 +224,42 @@ if __name__ == "__main__":
         "src_port": 443,
         "dst_port": 50000,
         "protocol": "TCP",
+        "contributing_signals": [],
+        "attack_type": None,
+        "type_confidence": None,
     }
 
-    print("Processing fake attack detection...")
+    fake_scan = {
+        "prediction": "ATTACK",
+        "confidence": 0.40,
+        "attack_probability": 0.10,
+        "src_ip": "192.0.2.50",
+        "dst_ip": "10.10.1.237",
+        "src_port": 4444,
+        "dst_port": 22,
+        "protocol": "TCP",
+        "contributing_signals": ["rule_based_scan"],
+        "attack_type": "Port Scan (rule-based)",
+        "type_confidence": None,
+    }
+
+    print("Processing fake ML attack...")
     manager.process_detection(fake_attack)
 
-    print("Processing fake benign detection (should NOT alert)...")
+    print("\nProcessing duplicate ML attack...")
+    manager.process_detection(fake_attack)
+
+    print("\nProcessing fake benign detection...")
     manager.process_detection(fake_benign)
 
+    print("\nProcessing fake rule-based scan...")
+    manager.process_detection(fake_scan)
+
+    print("\nProcessing duplicate rule-based scan...")
+    manager.process_detection(fake_scan)
+
     print(f"\nTotal alerts in memory: {manager.get_alert_count()}")
-    print("Recent alerts:")
-    for a in manager.get_recent_alerts():
-        print(a)
+
+    print("\nRecent alerts:")
+    for alert in manager.get_recent_alerts():
+        print(alert)
