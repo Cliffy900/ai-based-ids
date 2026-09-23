@@ -1,133 +1,238 @@
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
 import warnings
+from datetime import datetime
+
 warnings.simplefilter("ignore", category=UserWarning)
+
 from scapy.all import sniff, conf
 from scapy.layers.inet import IP, TCP, UDP
-from datetime import datetime
+
+from alerts.alert_manager import AlertManager
+from detection.detector import Detector
+from detection.ensemble import EnsembleDetector
+from detection.multiclass_detector import MulticlassDetector
 from detection.scan_detector import ScanDetector
+from preprocessing.feature_extraction import FlowTracker
+
 
 scan_detector = ScanDetector(window_seconds=10, port_threshold=15)
-
-from preprocessing.feature_extraction import FlowTracker
-from detection.detector import Detector
-from detection.multiclass_detector import MulticlassDetector
-from detection.ensemble import EnsembleDetector
-from alerts.alert_manager import AlertManager
-import json
-import subprocess
-import re
-
-def run_scan_test(target_ip, nmap_path=r"C:\Program Files (x86)\Nmap\nmap.exe"):
-    print(f"Launching nmap scan against {target_ip} ...")
-    subprocess.Popen([nmap_path, "-sS", target_ip])
 
 tracker = FlowTracker()
 detector = Detector()
 multiclass_detector = MulticlassDetector()
-ensemble = EnsembleDetector(detector, scan_detector, multiclass_detector)
+ensemble = EnsembleDetector(
+    detector,
+    scan_detector,
+    multiclass_detector,
+)
 alert_manager = AlertManager()
 
-import socket
+
+def run_scan_test(target_ip, nmap_path=None):
+    """
+    Launch an Nmap SYN scan against the target IP.
+
+    If nmap_path is not provided, locate Nmap using the operating
+    system's PATH. This works on Linux and Windows as long as Nmap
+    is installed and available on PATH.
+    """
+    if nmap_path is None:
+        nmap_path = shutil.which("nmap")
+
+    if not nmap_path:
+        raise RuntimeError(
+            "Nmap was not found. Install Nmap and make sure it is "
+            "available on your PATH."
+        )
+
+    print(f"Launching nmap scan against {target_ip} ...")
+
+    try:
+        subprocess.Popen([nmap_path, "-sS", target_ip])
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to launch Nmap using '{nmap_path}': {exc}"
+        ) from exc
+
 
 def get_local_ip():
     """
-    Gets the local IP address currently in use for outbound traffic,
-    without hardcoding it. Works by opening a dummy UDP socket to a
-    public IP (doesn't actually send data) and reading the local
-    address the OS would use.
+    Get the local IP address currently used for outbound traffic.
+
+    The UDP socket connection does not send application data. It lets
+    the operating system determine which local interface/address it
+    would use to reach the destination.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
     try:
         s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-    except Exception:
-        local_ip = "127.0.0.1"
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
     finally:
         s.close()
-    return local_ip
+
 
 def get_default_gateway():
     """
-    Parses 'ipconfig' output to find the active adapter's default
-    gateway IP, so we always scan/target something on the current
-    network without hardcoding an IP.
+    Detect the default IPv4 gateway in a platform-independent way.
+
+    Linux:
+        Reads the default route from `ip route`.
+
+    Windows:
+        Parses `ipconfig` output.
+
+    Returns:
+        Gateway IP address as a string, or None if it cannot be found.
     """
+    if os.name == "nt":
+        return _get_windows_gateway()
+
+    return _get_linux_gateway()
+
+
+def _get_linux_gateway():
+    """Read the default IPv4 gateway from the Linux routing table."""
     try:
-        output = subprocess.check_output("ipconfig", shell=True, text=True)
-    except Exception:
+        output = subprocess.check_output(
+            ["ip", "-4", "route"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
         return None
 
-    matches = re.findall(r"Default Gateway[.\s]*:\s*([\d.]+)", output)
-    for match in matches:
-        if match and match != "0.0.0.0":
-            return match
+    for line in output.splitlines():
+        match = re.match(r"^default via ([\d.]+)", line.strip())
+        if match:
+            return match.group(1)
+
     return None
+
+
+def _get_windows_gateway():
+    """Parse the default IPv4 gateway from Windows ipconfig output."""
+    try:
+        output = subprocess.check_output(
+            "ipconfig",
+            shell=True,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    matches = re.findall(
+        r"Default Gateway[.\s]*:\s*([\d.]+)",
+        output,
+    )
+
+    for gateway in matches:
+        if gateway and gateway != "0.0.0.0":
+            return gateway
+
+    return None
+
 
 def get_active_interface():
     """
-    Returns the scapy interface currently used for the default route --
-    avoids hardcoding 'Ethernet' vs a WiFi adapter name, which changes
-    depending on which network/adapter is actually active.
+    Return Scapy's interface currently associated with the default route.
+
+    This avoids hardcoding interface names such as 'Ethernet', 'Wi-Fi',
+    or 'eth0'.
     """
     return conf.iface
 
+
 def process_packet(packet):
-    if packet.haslayer(IP):
-        proto_name = "OTHER"
-        sport = dport = None
-        header_length = packet[IP].ihl * 4  # IP header length in bytes
-        tcp_flags = None
+    """Convert an IP packet into flow information and update detectors."""
+    if not packet.haslayer(IP):
+        return None
 
-        if packet.haslayer(TCP):
-            proto_name = "TCP"
-            sport, dport = packet[TCP].sport, packet[TCP].dport
-            header_length += packet[TCP].dataofs * 4  # add TCP header length
-            tcp_flags = str(packet[TCP].flags)  # e.g. "S", "SA", "PA", "FA"
-        elif packet.haslayer(UDP):
-            proto_name = "UDP"
-            sport, dport = packet[UDP].sport, packet[UDP].dport
+    proto_name = "OTHER"
+    sport = dport = None
 
-        info = {
-            "timestamp": datetime.now().isoformat(),
-            "src": packet[IP].src,
-            "dst": packet[IP].dst,
-            "protocol": proto_name,
-            "sport": sport,
-            "dport": dport,
-            "length": len(packet),
-            "header_length": header_length,
-            "tcp_flags": tcp_flags,
-        }
+    header_length = packet[IP].ihl * 4
+    tcp_flags = None
 
+    if packet.haslayer(TCP):
+        proto_name = "TCP"
+        sport = packet[TCP].sport
+        dport = packet[TCP].dport
+        header_length += packet[TCP].dataofs * 4
+        tcp_flags = str(packet[TCP].flags)
+
+    elif packet.haslayer(UDP):
+        proto_name = "UDP"
+        sport = packet[UDP].sport
+        dport = packet[UDP].dport
+
+    info = {
+        "timestamp": datetime.now().isoformat(),
+        "src": packet[IP].src,
+        "dst": packet[IP].dst,
+        "protocol": proto_name,
+        "sport": sport,
+        "dport": dport,
+        "length": len(packet),
+        "header_length": header_length,
+        "tcp_flags": tcp_flags,
+    }
+
+    print(
+        f"[{info['timestamp']}] {info['src']}:{info['sport']} -> "
+        f"{info['dst']}:{info['dport']} | {info['protocol']} | "
+        f"{info['length']} bytes"
+    )
+
+    # Update the flow tracker.
+    tracker.process_packet_info(info)
+
+    # Check every packet for port-scan activity.
+    scan_alert = scan_detector.record_packet(
+        src_ip=info["src"],
+        dst_ip=info["dst"],
+        dst_port=info["dport"],
+    )
+
+    if scan_alert:
         print(
-            f"[{info['timestamp']}] {info['src']}:{info['sport']} -> "
-            f"{info['dst']}:{info['dport']} | {info['protocol']} | {info['length']} bytes"
+            f"\n🚨 PORT SCAN DETECTED | "
+            f"{scan_alert['src_ip']} contacted "
+            f"{scan_alert['distinct_ports_contacted']} distinct ports "
+            f"on {scan_alert['target_ip']} within "
+            f"{scan_alert['window_seconds']}s\n"
         )
 
-        tracker.process_packet_info(info)  # feed into flow aggregation
+        alert_manager.recent_alerts.append(scan_alert)
 
-        scan_alert = scan_detector.record_packet(
-            src_ip=info["src"],
-            dst_ip=info["dst"],
-            dst_port=info["dport"],
-        )
-        if scan_alert:
-            print(
-                f"\n🚨 PORT SCAN DETECTED | {scan_alert['src_ip']} contacted "
-                f"{scan_alert['distinct_ports_contacted']} distinct ports on "
-                f"{scan_alert['target_ip']} within {scan_alert['window_seconds']}s\n"
-            )
-            alert_manager.recent_alerts.append(scan_alert)
-            with open(alert_manager.log_file, "a") as f:
-                f.write(json.dumps(scan_alert) + "\n")
+        with open(alert_manager.log_file, "a") as f:
+            f.write(json.dumps(scan_alert) + "\n")
 
-        return info
+    return info
 
-def start_capture(interface=None, packet_count=0, bpf_filter=None, timeout=None):
+
+def start_capture(
+    interface=None,
+    packet_count=0,
+    bpf_filter=None,
+    timeout=None,
+):
     """
-    interface: e.g. 'eth0' or 'Wi-Fi' (None = default)
-    packet_count: 0 = capture indefinitely (ignored if timeout is set)
-    bpf_filter: e.g. 'tcp or udp' to reduce noise
-    timeout: if set, capture stops after this many seconds regardless of packet count
+    Start packet capture.
+
+    Args:
+        interface: Scapy interface name. None uses the default interface.
+        packet_count: Number of packets to capture. 0 means unlimited.
+        bpf_filter: Optional BPF filter such as 'tcp or udp'.
+        timeout: Optional maximum capture duration in seconds.
     """
     sniff(
         iface=interface,
@@ -135,9 +240,8 @@ def start_capture(interface=None, packet_count=0, bpf_filter=None, timeout=None)
         count=packet_count,
         filter=bpf_filter,
         timeout=timeout,
-        store=False,  # don't keep packets in memory, important for long-running capture
+        store=False,
     )
-
 
 
 if __name__ == "__main__":
@@ -150,26 +254,60 @@ if __name__ == "__main__":
     print(f"Detected active interface: {active_iface}")
 
     target_ip = get_default_gateway()
+
     if not target_ip:
-        print("Could not detect default gateway, falling back to manual entry.")
-        target_ip = "192.168.5.1"
+        raise RuntimeError(
+            "Could not detect the default gateway. "
+            "Check your network connection and routing table."
+        )
+
     print(f"Detected target IP (gateway): {target_ip}")
 
     run_scan_test(target_ip=target_ip)
-    time.sleep(1)  # give nmap a moment to actually start sending packets
 
-    start_capture(interface=active_iface, packet_count=0, bpf_filter=f"host {target_ip}", timeout=15)
+    # Give Nmap a moment to start generating packets.
+    time.sleep(1)
+
+    start_capture(
+        interface=active_iface,
+        packet_count=0,
+        bpf_filter=f"host {target_ip}",
+        timeout=15,
+    )
 
     print("\nCapture stopped.")
 
-    all_flows = tracker.get_active_flow_features() + tracker.get_completed_flows()
+    all_flows = (
+        tracker.get_active_flow_features()
+        + tracker.get_completed_flows()
+    )
 
-    print(f"\n--- {len(all_flows)} TOTAL FLOWS AFTER CAPTURE (ensemble decision) ---")
+    print(
+        f"\n--- {len(all_flows)} TOTAL FLOWS AFTER CAPTURE "
+        f"(ensemble decision) ---"
+    )
+
     for flow_features in all_flows:
         result = ensemble.evaluate(flow_features)
-        signals = ", ".join(result["contributing_signals"]) if result["contributing_signals"] else "none"
-        type_str = f" | type: {result['attack_type']}" if result["attack_type"] else ""
-        print(f"{result['prediction']} (signals: {signals}) | "
-              f"{result['src_ip']}:{result['src_port']} -> {result['dst_ip']}:{result['dst_port']} "
-              f"[{result['protocol']}]{type_str}")
+
+        signals = (
+            ", ".join(result["contributing_signals"])
+            if result["contributing_signals"]
+            else "none"
+        )
+
+        type_str = (
+            f" | type: {result['attack_type']}"
+            if result["attack_type"]
+            else ""
+        )
+
+        print(
+            f"{result['prediction']} "
+            f"(signals: {signals}) | "
+            f"{result['src_ip']}:{result['src_port']} -> "
+            f"{result['dst_ip']}:{result['dst_port']} "
+            f"[{result['protocol']}]{type_str}"
+        )
+
         alert_manager.process_detection(result)
