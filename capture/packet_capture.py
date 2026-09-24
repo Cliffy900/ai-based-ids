@@ -246,7 +246,7 @@ def process_packet(packet):
         sport = packet[UDP].sport
         dport = packet[UDP].dport
 
-        info = {
+    info = {
         "timestamp": float(packet.time),
         "captured_at": datetime.now().isoformat(),
         "src": packet[IP].src,
@@ -325,6 +325,7 @@ def start_capture(
         timeout=timeout,
         store=False,
     )
+
 
 if __name__ == "__main__":
     import time
