@@ -246,8 +246,9 @@ def process_packet(packet):
         sport = packet[UDP].sport
         dport = packet[UDP].dport
 
-    info = {
-        "timestamp": datetime.now().isoformat(),
+        info = {
+        "timestamp": float(packet.time),
+        "captured_at": datetime.now().isoformat(),
         "src": packet[IP].src,
         "dst": packet[IP].dst,
         "protocol": proto_name,
@@ -259,7 +260,7 @@ def process_packet(packet):
     }
 
     print(
-        f"[{info['timestamp']}] "
+        f"[{info['captured_at']}] "
         f"{info['src']}:{info['sport']} -> "
         f"{info['dst']}:{info['dport']} | "
         f"{info['protocol']} | "
