@@ -10,6 +10,7 @@ Responsibilities:
 - print alerts to the console
 - store alerts in memory for the dashboard
 - persist alerts as JSON Lines
+- restore alert state after application restarts
 """
 
 import os
@@ -49,6 +50,10 @@ class AlertManager:
         self.active_incidents = {}
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+
+        # Restore persisted state so alert history and incident
+        # deduplication survive application restarts.
+        self._restore_state()
 
     def process_detection(self, detection_result: dict):
         """
@@ -121,6 +126,59 @@ class AlertManager:
         self.active_incidents[incident_key] = datetime.now()
 
         return True
+
+    def _restore_state(self):
+        """
+        Restore recent alerts and active incident cooldowns from disk.
+
+        Alerts older than the configured incident cooldown are kept in
+        recent_alerts for dashboard history, but they are not restored
+        into active_incidents because their cooldown has expired.
+        """
+
+        if not os.path.exists(self.log_file):
+            return
+
+        now = datetime.now()
+
+        try:
+            with open(self.log_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    try:
+                        alert = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    self.recent_alerts.append(alert)
+
+                    timestamp = alert.get("timestamp")
+
+                    if not timestamp:
+                        continue
+
+                    try:
+                        alert_time = datetime.fromisoformat(timestamp)
+                    except (TypeError, ValueError):
+                        continue
+
+                    elapsed = now - alert_time
+
+                    if elapsed < timedelta(seconds=self.incident_cooldown):
+                        incident_key = alert.get("incident_key")
+
+                        if incident_key:
+                            self.active_incidents[
+                                tuple(incident_key)
+                            ] = alert_time
+
+        except OSError:
+            # If the log cannot be read, start with empty in-memory state.
+            return
 
     def _is_duplicate_incident(self, incident_key):
         """
