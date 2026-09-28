@@ -355,7 +355,7 @@ if __name__ == "__main__":
             "interface": active_iface,
             "packet_count": 0,
             "bpf_filter": f"host {target_ip}",
-            "timeout": 15,
+            "timeout": 35,
         },
     )
 
