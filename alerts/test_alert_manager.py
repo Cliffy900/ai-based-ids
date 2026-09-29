@@ -4,7 +4,7 @@ Tests for AlertManager alert persistence and incident deduplication.
 
 import json
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from alerts.alert_manager import AlertManager
 
@@ -59,6 +59,49 @@ def test_alert_persists_across_restart():
         print("PASSED: alert state survived restart")
 
 
+def test_expired_alert_is_not_restored_as_active_incident():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        log_file = f"{temp_dir}/alerts.jsonl"
+
+        expired_time = (
+            datetime.now() - timedelta(seconds=31)
+        ).isoformat()
+
+        expired_alert = {
+            "timestamp": expired_time,
+            "src_ip": "203.0.113.5",
+            "dst_ip": "10.10.1.237",
+            "attack_type": "Brute Force",
+            "incident_key": [
+                "203.0.113.5",
+                "10.10.1.237",
+                "Brute Force",
+            ],
+        }
+
+        with open(log_file, "w") as f:
+            f.write(json.dumps(expired_alert) + "\n")
+
+        manager = AlertManager(
+            log_file=log_file,
+            incident_cooldown=30,
+        )
+
+        # The alert should remain in history.
+        assert manager.get_alert_count() == 1
+
+        # But it should no longer be considered an active incident.
+        assert (
+            tuple(expired_alert["incident_key"])
+            not in manager.active_incidents
+        )
+
+        print(
+            "PASSED: expired alert was not restored "
+            "as an active incident"
+        )
+
+
 def test_corrupt_log_lines_are_ignored():
     with tempfile.TemporaryDirectory() as temp_dir:
         log_file = f"{temp_dir}/alerts.jsonl"
@@ -90,6 +133,7 @@ def test_corrupt_log_lines_are_ignored():
 
 if __name__ == "__main__":
     test_alert_persists_across_restart()
+    test_expired_alert_is_not_restored_as_active_incident()
     test_corrupt_log_lines_are_ignored()
 
     print("\nAll AlertManager persistence tests passed.")
